@@ -471,6 +471,38 @@ fn extract_script_children(content: &str, start_line: u32, id_prefix: &str) -> V
     children
 }
 
+// A CSS value may contain a balanced block (for instance a custom property).
+// End at a top-level semicolon or rule brace, not at a value's closing brace.
+fn css_declaration_value(remainder: &str) -> &str {
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut end = remainder.len();
+    for (index, byte) in remainder.bytes().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' if depth > 0 => depth -= 1,
+            b'}' | b';' if depth == 0 => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    remainder[..end].trim()
+}
+
 fn extract_style_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     for (line_idx, raw_line) in content.lines().enumerate() {
@@ -491,7 +523,7 @@ fn extract_style_children(content: &str, start_line: u32, id_prefix: &str) -> Ve
                 let mut decl = make_leaf(&child_id, "style_declaration", property, absolute_line, start_col, end_col);
                 if let Some(colon) = line.find(':') {
                     let remainder = &line[colon + 1..];
-                    let rhs = remainder.trim().trim_end_matches(';').trim_end_matches('}').trim();
+                    let rhs = css_declaration_value(remainder);
                     if !rhs.is_empty() {
                         let rhs_start = start_col + (colon + 1 + remainder.len() - remainder.trim_start().len()) as u32;
                         decl.children = vec![make_leaf(
@@ -772,6 +804,21 @@ const x = 1;
         assert_eq!(attr["position"]["start_line"], 1);
         assert_eq!(attr["position"]["start_col"], 8);
         assert_eq!(attr["position"]["end_col"], 12);
+    }
+
+    #[test]
+    fn css_custom_property_preserves_balanced_value_brace() {
+        let source = "<style>\n  .x {\n    --theme: { color: red; };\n  }\n</style>";
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source, "App.vue")).unwrap();
+        let value = &tree["children"][0]["children"][1]["children"][0];
+        let line = source.lines().nth(2).unwrap();
+        let expected = "{ color: red; }";
+        let start = line.find(expected).unwrap();
+        assert_eq!(value["node_type"], "style_value");
+        assert_eq!(value["label"], expected);
+        assert_eq!(value["position"]["start_line"], 2);
+        assert_eq!(value["position"]["start_col"], start as u32);
+        assert_eq!(value["position"]["end_col"], (start + expected.len()) as u32);
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
