@@ -380,21 +380,61 @@ fn property_name(line: &str) -> Option<&str> {
     }
 }
 
-fn assignment_label(line: &str) -> Option<String> {
-    for op in ["+=", "-=", "*=", "/=", "="] {
-        if let Some((left, _)) = line.split_once(op) {
-            let label = left.trim();
-            if !label.is_empty()
-                && !label.starts_with("return")
-                && !label.starts_with("const ")
-                && !label.starts_with("let ")
-                && !label.starts_with("var ")
-            {
-                return Some(label.to_string());
+// Locate the outer assignment. Operators in nested expressions or strings
+// belong to the RHS and cannot delimit the current statement.
+fn outer_assignment_operator(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
             }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | 0x60 => quote = Some(byte),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'=' if depth == 0 => {
+                if bytes.get(index + 1).is_some_and(|b| matches!(b, b'=' | b'>'))
+                    || (index > 0 && matches!(bytes[index - 1], b'=' | b'!' | b'<' | b'>'))
+                {
+                    continue;
+                }
+                let start = if index > 0
+                    && matches!(bytes[index - 1], b'+' | b'-' | b'*' | b'/')
+                {
+                    index - 1
+                } else {
+                    index
+                };
+                return Some((start, index + 1 - start));
+            }
+            _ => {}
         }
     }
     None
+}
+
+fn assignment_label(line: &str) -> Option<String> {
+    let (index, _) = outer_assignment_operator(line)?;
+    let label = line[..index].trim();
+    if label.is_empty()
+        || label.starts_with("return")
+        || label.starts_with("const ")
+        || label.starts_with("let ")
+        || label.starts_with("var ")
+    {
+        return None;
+    }
+    Some(label.to_string())
 }
 
 
@@ -448,14 +488,11 @@ fn extract_script_children(content: &str, start_line: u32, id_prefix: &str) -> V
             let mut assignment = make_leaf(
                 &child_id, "assignment_statement", label, absolute_line, start_col, end_col,
             );
-            if let Some((index, op)) = ["+=", "-=", "*=", "/=", "="]
-                .into_iter()
-                .find_map(|op| line.find(op).map(|index| (index, op)))
-            {
-                let remainder = &line[index + op.len()..];
+            if let Some((index, op_len)) = outer_assignment_operator(&line) {
+                let remainder = &line[index + op_len..];
                 let rhs = remainder.trim();
                 if !rhs.is_empty() {
-                    let rhs_start = start_col + (index + op.len() + remainder.len() - remainder.trim_start().len()) as u32;
+                    let rhs_start = start_col + (index + op_len + remainder.len() - remainder.trim_start().len()) as u32;
                     assignment.children = vec![make_leaf(
                         &format!("{child_id}.0"), "assignment_value", rhs,
                         absolute_line, rhs_start, rhs_start + rhs.len() as u32,
@@ -819,6 +856,27 @@ const x = 1;
         assert_eq!(value["position"]["start_line"], 2);
         assert_eq!(value["position"]["start_col"], start as u32);
         assert_eq!(value["position"]["end_col"], (start + expected.len()) as u32);
+    }
+
+    #[test]
+    fn nested_compound_and_quoted_operators_keep_outer_assignment_rhs() {
+        let source = "<script>\n  result = (count += 1);\n  message = \"a+=b\";\n</script>";
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source, "App.vue")).unwrap();
+        for (child_index, line_index, expected) in [
+            (0usize, 1usize, "(count += 1)"),
+            (1usize, 2usize, "\"a+=b\""),
+        ] {
+            let assignment = &tree["children"][0]["children"][child_index];
+            assert_eq!(assignment["node_type"], "assignment_statement");
+            let value = &assignment["children"][0];
+            let line = source.lines().nth(line_index).unwrap();
+            let start = line.find(expected).unwrap();
+            assert_eq!(value["node_type"], "assignment_value");
+            assert_eq!(value["label"], expected);
+            assert_eq!(value["position"]["start_line"], line_index as u32);
+            assert_eq!(value["position"]["start_col"], start as u32);
+            assert_eq!(value["position"]["end_col"], (start + expected.len()) as u32);
+        }
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
