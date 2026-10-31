@@ -248,7 +248,8 @@ fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
         })
         .collect()
 }
-fn parse_tag_segment(segment: &str) -> Option<(String, String)> {
+fn parse_tag_segment(segment: &str) -> Option<(String, String, usize)> {
+    let trimmed_offset = segment.len() - segment.trim_start().len();
     let trimmed = segment.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('!') {
         return None;
@@ -260,12 +261,11 @@ fn parse_tag_segment(segment: &str) -> Option<(String, String)> {
     if tag.is_empty() {
         return None;
     }
-    let attrs = trimmed[tag_end..]
-        .trim()
-        .trim_end_matches('/')
-        .trim()
-        .to_string();
-    Some((tag.to_lowercase(), attrs))
+    let tail = &trimmed[tag_end..];
+    // Compute the original byte offset rather than searching for duplicated attrs.
+    let attr_start = trimmed_offset + tag_end + tail.len() - tail.trim_start().len();
+    let attrs = tail.trim().trim_end_matches('/').trim().to_string();
+    Some((tag.to_lowercase(), attrs, attr_start))
 }
 
 
@@ -297,11 +297,10 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
             let after_open = &rest[open_idx + 1..];
             if let Some(close_idx) = after_open.find('>') {
                 let segment = &after_open[..close_idx];
-                if let Some((tag, attrs)) = parse_tag_segment(segment) {
+                if let Some((tag, attrs, attr_start)) = parse_tag_segment(segment) {
                     let child_id = format!("{}.{}", id_prefix, children.len());
                     let local_start = consumed + open_idx;
                     let local_end = local_start + close_idx + 2;
-                    let attr_start = segment.find(&attrs).unwrap_or(segment.len());
                     let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
                         .into_iter()
                         .enumerate()
@@ -762,6 +761,17 @@ const x = 1;
         assert_eq!(value["position"]["start_line"], 1);
         assert_eq!(value["position"]["start_col"], 11);
         assert_eq!(value["position"]["end_col"], 12);
+    }
+
+    #[test]
+    fn duplicate_tag_attribute_uses_true_source_byte_offset() {
+        let source = "<template>\n  <slot slot></slot>\n</template>";
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source, "App.vue")).unwrap();
+        let attr = &tree["children"][0]["children"][0]["children"][0];
+        assert_eq!(attr["label"], "slot");
+        assert_eq!(attr["position"]["start_line"], 1);
+        assert_eq!(attr["position"]["start_col"], 8);
+        assert_eq!(attr["position"]["end_col"], 12);
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
