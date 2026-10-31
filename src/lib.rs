@@ -403,7 +403,7 @@ fn outer_assignment_operator(line: &str) -> Option<(usize, usize)> {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth = depth.saturating_sub(1),
             b'=' if depth == 0 => {
-                if bytes.get(index + 1).is_some_and(|b| matches!(b, b'=' | b'>'))
+                if bytes.get(index + 1).is_some_and(|b| matches!(*b, b'=' | b'>'))
                     || (index > 0 && matches!(bytes[index - 1], b'=' | b'!' | b'<' | b'>'))
                 {
                     continue;
