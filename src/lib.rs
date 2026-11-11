@@ -727,6 +727,63 @@ fn classify_statement(idx: &LineIndex, id: &str, line: &str, abs: usize) -> Sema
     leaf_at(idx, id, "statement", canonical_js(line), abs, end)
 }
 
+/// `row` with every `/* ... */` comment byte replaced by a space, so byte
+/// offsets still index the row. String and regex literals are opaque and a
+/// `//` comment is left for `script_segments`. `in_comment` carries an open
+/// block comment across rows.
+fn blank_block_comments(row: &str, in_comment: &mut bool) -> String {
+    let b = row.as_bytes();
+    let mut out = b.to_vec();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if *in_comment {
+            if b[i..].starts_with(b"*/") {
+                *in_comment = false;
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+            } else {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'/' if b.get(i + 1) == Some(&b'/') => break,
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                *in_comment = true;
+                continue;
+            }
+            b'/' => {
+                if let Some(j) = regex_end(b, i) {
+                    i = j;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Only whole multi-byte characters inside comments were replaced, byte by
+    // byte, with ASCII spaces, so the result is still valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| row.to_string())
+}
+
 fn extract_script_children(
     src: &str,
     idx: &LineIndex,
@@ -741,18 +798,11 @@ fn extract_script_children(
         let row_off = row_start;
         row_start += raw_row.len() + 1;
         let row = raw_row.strip_suffix('\r').unwrap_or(raw_row);
-        let trimmed = row.trim();
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if trimmed.starts_with("/*") {
-            in_block_comment = !trimmed.contains("*/");
-            continue;
-        }
-        for (seg_off, segment) in script_segments(row) {
+        // Block comments become spaces (offsets kept), so code before or after
+        // them on the row, including after the `*/` closing a multi-line
+        // comment, is parsed like any other statement.
+        let row = blank_block_comments(row, &mut in_block_comment);
+        for (seg_off, segment) in script_segments(&row) {
             let line = normalize_statement(segment);
             if line.is_empty() || line.bytes().all(|c| matches!(c, b'{' | b'}' | b'(' | b')' | b'[' | b']' | b',' | b';' | b' ')) {
                 continue;
@@ -1565,6 +1615,39 @@ const x = 1;
         assert_preserved(
             "<script>\nconst re = /[//]foo/; // one\n</script>\n",
             "<script>\nconst re = /[//]foo/; // two\n</script>\n",
+        );
+    }
+
+    // --- buchochelliq-labs/intentumdiff-vue-parser#9 ---------------------------
+
+    #[test]
+    fn code_after_block_comment_is_retained() {
+        let old = "<script>\n/* note */ const count = 1;\n</script>\n";
+        let new = "<script>\n/* note */ const count = 2;\n</script>\n";
+        assert_span_after(old, "declaration_value", "1", "count = ", "1");
+        assert_span_after(new, "declaration_value", "2", "count = ", "2");
+        assert_span(old, "variable_declaration", "count", "const count = 1");
+        assert_changed(old, new);
+        // Code after the `*/` that closes a multi-line comment.
+        let multi = "<script>\n/* a\n b */ const count = 1;\n</script>\n";
+        assert_span_after(multi, "declaration_value", "1", "b */", "1");
+        assert_changed(multi, "<script>\n/* a\n b */ const count = 2;\n</script>\n");
+        // Comment-only edits stay non-semantic, wherever the comment sits.
+        let plain = "<script>\nconst count = 1;\n</script>\n";
+        assert_preserved(plain, old);
+        assert_preserved(plain, multi);
+        assert_preserved(plain, "<script>\nconst count = /* n */ 1; /* t */\n</script>\n");
+        assert_preserved(plain, "<script>\n/* one */ /* two */ const count = 1;\n</script>\n");
+        // `/*` inside a string or regex is data, and after `//` is a line comment.
+        assert_changed(
+            "<script>\nconst s = \"/* a */\";\n</script>\n",
+            "<script>\nconst s = \"/* b */\";\n</script>\n",
+        );
+        assert_span("<script>\nconst r = /[/*]/; const t = 1;\n</script>\n", "declaration_value", "/[/*]/", "/[/*]/");
+        assert_span_after("<script>\nconst r = /[/*]/; const t = 1;\n</script>\n", "declaration_value", "1", "t = ", "1");
+        assert_preserved(
+            "<script>\nconst x = 1; // c /* d\nconst y = 2;\n</script>\n",
+            "<script>\nconst x = 1;\nconst y = 2;\n</script>\n",
         );
     }
 }
