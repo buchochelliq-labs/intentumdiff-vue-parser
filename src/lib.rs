@@ -554,8 +554,61 @@ fn extract_template_children(
 // Script
 // ---------------------------------------------------------------------------
 
+/// Whether a `/` following `prefix` starts a regular-expression literal rather
+/// than a division: at the start, after an operator or opening punctuator, or
+/// after a keyword such as `return`/`typeof` (never after an identifier,
+/// number or closing bracket).
+fn regex_allowed(prefix: &[u8]) -> bool {
+    let prefix = prefix.trim_ascii_end();
+    let Some(&last) = prefix.last() else {
+        return true;
+    };
+    if b"(,=:[!&|?{};+-*%<>~^".contains(&last) {
+        return true;
+    }
+    let word_start = prefix
+        .iter()
+        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
+        .map_or(0, |p| p + 1);
+    matches!(
+        &prefix[word_start..],
+        b"return" | b"typeof" | b"instanceof" | b"in" | b"of" | b"new" | b"delete" | b"void"
+            | b"throw" | b"case" | b"do" | b"else" | b"yield" | b"await"
+    )
+}
+
+/// End (exclusive, after flags) of the regular-expression literal starting at
+/// the `/` at `i`, or `None` when that `/` is a division, a comment opener, or
+/// an unterminated pattern. Escapes and `[...]` classes may contain `/`.
+fn regex_end(b: &[u8], i: usize) -> Option<usize> {
+    if matches!(b.get(i + 1), Some(b'/' | b'*')) || !regex_allowed(&b[..i]) {
+        return None;
+    }
+    let mut in_class = false;
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 1,
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => {
+                j += 1;
+                while j < b.len() && b[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                return Some(j);
+            }
+            b'\n' => return None,
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Split one script row into statements at top-level `;`, dropping a trailing
-/// `//` comment. Returns `(offset_in_row, text)` pairs.
+/// `//` comment. String and regex literals are opaque. Returns
+/// `(offset_in_row, text)` pairs.
 fn script_segments(line: &str) -> Vec<(usize, &str)> {
     let b = line.as_bytes();
     let mut out = Vec::new();
@@ -585,6 +638,12 @@ fn script_segments(line: &str) -> Vec<(usize, &str)> {
             b'/' if b.get(i + 1) == Some(&b'/') => {
                 end = i;
                 break;
+            }
+            b'/' => {
+                if let Some(j) = regex_end(b, i) {
+                    i = j;
+                    continue;
+                }
             }
             b';' if depth == 0 => {
                 out.push((start, &line[start..i]));
@@ -1487,5 +1546,25 @@ const x = 1;
     fn custom_block_content_is_retained() {
         assert_changed("<docs>old</docs>\n", "<docs>new</docs>\n");
         assert_span("<docs>\n# Title\n</docs>\n", "block_content", "# Title", "# Title");
+    }
+
+    // --- buchochelliq-labs/intentumdiff-vue-parser#8 ---------------------------
+
+    #[test]
+    fn regex_literal_slashes_are_not_comments() {
+        let old = "<script>\nconst re = /[//]foo/;\n</script>\n";
+        let new = "<script>\nconst re = /[//]bar/;\n</script>\n";
+        assert_span(old, "declaration_value", "/[//]foo/", "/[//]foo/");
+        assert_span(new, "declaration_value", "/[//]bar/", "/[//]bar/");
+        assert_changed(old, new);
+        // Escaped slash, `;` inside the pattern, flags, and a real trailing comment.
+        let src = "<script>\nconst a = /a\\/\\/b;c/g; // note\nconst b = x / 2; // half\n</script>\n";
+        assert_span(src, "declaration_value", "/a\\/\\/b;c/g", "/a\\/\\/b;c/g");
+        assert_span(src, "declaration_value", "x / 2", "x / 2");
+        assert_preserved(src, "<script>\nconst a = /a\\/\\/b;c/g;\nconst b = x / 2;\n</script>\n");
+        assert_preserved(
+            "<script>\nconst re = /[//]foo/; // one\n</script>\n",
+            "<script>\nconst re = /[//]foo/; // two\n</script>\n",
+        );
     }
 }
